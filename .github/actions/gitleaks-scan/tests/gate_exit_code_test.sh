@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-GATE_EXIT_SH="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/gate-exit-code.sh"
+ACTION_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+GATE_EXIT_SH="${ACTION_DIR}/gate-exit-code.sh"
+GATE_WORKFLOW="${ACTION_DIR}/../../workflows/secret-scan-gate.yml"
 
 gate_code() {
   "$GATE_EXIT_SH" "$@" 2>/dev/null
@@ -55,4 +57,40 @@ test_report_mode_never_fails() {
 test_non_numeric_status_fails() {
   assert_eq "$(gate_code "" gate false)" "1" "empty status must fail"
   assert_eq "$(gate_code abc gate false)" "1" "non-numeric status must fail"
+}
+
+test_report_mode_never_fails_even_with_fail_on_finding_false() {
+  assert_eq "$(gate_code 42 report false)" "0" "report mode must not fail on a finding with fail-on-finding false"
+}
+
+test_only_exit_42_is_suppressed() {
+  local code
+  for code in 2 3 126 127 255; do
+    assert_eq "$(gate_code "$code" gate false)" "$code" "exit $code must propagate even with fail-on-finding false"
+  done
+}
+
+test_stdout_is_only_the_code_when_warning_is_emitted() {
+  local out
+  out=$("$GATE_EXIT_SH" 42 gate false 2>/dev/null)
+  assert_eq "$out" "0" "stdout must be exactly the exit code, the warning goes to stderr"
+}
+
+test_action_wires_fail_on_finding_input_and_env() {
+  local action="${ACTION_DIR}/action.yml"
+  grep -q '^  fail-on-finding:$' "$action"
+  assert_success "$?" "action.yml must declare the fail-on-finding input"
+  grep -A1 '^  fail-on-finding:$' "$action" | grep -q 'default: "true"'
+  assert_success "$?" "fail-on-finding must default to true in action.yml"
+  grep -q 'FAIL_ON_FINDING: ${{ inputs.fail-on-finding }}' "$action"
+  assert_success "$?" "the gate step must pass inputs.fail-on-finding via env"
+}
+
+test_gate_workflow_wires_fail_on_finding_default_true() {
+  grep -A2 '^      fail-on-finding:$' "$GATE_WORKFLOW" | grep -q 'type: boolean'
+  assert_success "$?" "the gate workflow input must be boolean"
+  grep -A3 '^      fail-on-finding:$' "$GATE_WORKFLOW" | grep -q 'default: true'
+  assert_success "$?" "the gate workflow input must default to true"
+  grep -q 'fail-on-finding: ${{ inputs.fail-on-finding }}' "$GATE_WORKFLOW"
+  assert_success "$?" "the gate workflow must forward the input to the action"
 }

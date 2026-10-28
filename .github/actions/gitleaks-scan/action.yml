@@ -99,7 +99,10 @@ runs:
         # an empty/typo'd `mode` behaves like gate, and only fail-on-finding
         # exactly "false" stops a finding from failing the job. Report mode
         # never fails this step; the report step reads steps.gate.outputs.*.
-        exit "$("${{ github.action_path }}/gate-exit-code.sh" "$status" "$MODE" "$FAIL_ON_FINDING")"
+        if [ "$MODE" = "report" ]; then
+          exit 0
+        fi
+        exit "$("$GITHUB_ACTION_PATH/gate-exit-code.sh" "$status" "$MODE" "$FAIL_ON_FINDING")"
 
     - id: derive
       if: inputs.mode == 'report'

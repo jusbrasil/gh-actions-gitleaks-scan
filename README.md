@@ -39,8 +39,6 @@ To roll out without blocking anyone, set `fail-on-finding: false`. Findings are 
       fail-on-finding: false
 ```
 
-A missing `gitleaks-baseline.json` is treated as an empty baseline. A baseline that exists but is not a valid JSON array fails the job.
-
 To also report findings, add a second job. The calling job must grant `id-token: write`:
 
 ```yaml
@@ -60,7 +58,7 @@ Pin to an immutable tag or a commit SHA. Do not use a branch.
 
 | Input | Default | Description |
 | --- | --- | --- |
-| `baseline-path` | `gitleaks-baseline.json` | Gitleaks baseline file, relative to the repo root. |
+| `baseline-path` | `gitleaks-baseline.json` | Gitleaks baseline file, relative to the repo root. A missing file is treated as an empty baseline. A file that exists but is not a valid JSON array fails the job. |
 | `config-path` | empty | Custom Gitleaks config. Empty means Gitleaks auto-discovers `.gitleaks.toml`. |
 | `gitleaks-version` | `8.30.1` | Gitleaks release to install. |
 | `gitleaks-sha256` | checksum of `8.30.1` | SHA-256 of the `linux_x64` tarball. Update it together with the version. |
