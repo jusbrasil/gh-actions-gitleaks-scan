@@ -21,6 +21,9 @@ inputs:
   gitleaks-sha256:
     default: "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
     description: "SHA-256 of the linux_x64 release tarball for gitleaks-version — must always be updated together with it."
+  fail-on-finding:
+    default: "true"
+    description: "Gate mode only. 'false' makes a finding log a warning instead of failing the job (observation mode). Any other value keeps the gate blocking. Execution errors always fail."
   relay-url:
     default: ""
     description: "Findings Relay base URL. Required (non-empty) in report mode; unused in gate mode."
@@ -73,6 +76,7 @@ runs:
         BASELINE_PATH: ${{ inputs.baseline-path }}
         CONFIG_PATH: ${{ inputs.config-path }}
         MODE: ${{ inputs.mode }}
+        FAIL_ON_FINDING: ${{ inputs.fail-on-finding }}
         REPORT_PATH: ${{ runner.temp }}/gate-report.json
       run: |
         set +e
@@ -91,19 +95,11 @@ runs:
         echo "gate-status=$status" >> "$GITHUB_OUTPUT"
         echo "range-fallback=${fallback:-0}" >> "$GITHUB_OUTPUT"
         echo "log-opts=${log_opts:-}" >> "$GITHUB_OUTPUT"
-        # `!= "report"`, not `= "gate"` (round-5 review fix — fail-closed,
-        # not fail-open): this is a security gate. An empty/typo'd `mode`
-        # input should behave like gate (propagate the real exit code) and
-        # block merge on a real finding, not silently behave like report
-        # (never fail) just because it didn't match the string "gate"
-        # exactly.
-        if [ "$MODE" != "report" ]; then
-          exit "$status"
-        fi
-        # mode == report: never fail this step regardless of gate-status —
-        # the report step (Task 8) reads steps.gate.outputs.* directly, and
-        # this workflow's own job status never matters to anything (spec §7).
-        exit 0
+        # The exit code comes from gate-exit-code.sh (unit tested). Fail-closed:
+        # an empty/typo'd `mode` behaves like gate, and only fail-on-finding
+        # exactly "false" stops a finding from failing the job. Report mode
+        # never fails this step; the report step reads steps.gate.outputs.*.
+        exit "$("${{ github.action_path }}/gate-exit-code.sh" "$status" "$MODE" "$FAIL_ON_FINDING")"
 
     - id: derive
       if: inputs.mode == 'report'
