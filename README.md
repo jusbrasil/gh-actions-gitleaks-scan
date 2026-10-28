@@ -28,6 +28,17 @@ jobs:
     uses: jusbrasil/gh-actions-gitleaks-scan/.github/workflows/secret-scan-gate.yml@v1.0.0
 ```
 
+### Observation mode
+
+To roll out without blocking anyone, set `fail-on-finding: false`. Findings are still printed, redacted, in the job log and a warning is added to the run. Do not mark the job as a required check until you switch it back to `true`.
+
+```yaml
+  gate:
+    uses: jusbrasil/gh-actions-gitleaks-scan/.github/workflows/secret-scan-gate.yml@v1.0.0
+    with:
+      fail-on-finding: false
+```
+
 To also report findings, add a second job. The calling job must grant `id-token: write`:
 
 ```yaml
@@ -47,10 +58,11 @@ Pin to an immutable tag or a commit SHA. Do not use a branch.
 
 | Input | Default | Description |
 | --- | --- | --- |
-| `baseline-path` | `gitleaks-baseline.json` | Gitleaks baseline file, relative to the repo root. |
+| `baseline-path` | `gitleaks-baseline.json` | Gitleaks baseline file, relative to the repo root. A missing file is treated as an empty baseline. A file that exists but is not a valid JSON array fails the job. |
 | `config-path` | empty | Custom Gitleaks config. Empty means Gitleaks auto-discovers `.gitleaks.toml`. |
 | `gitleaks-version` | `8.30.1` | Gitleaks release to install. |
 | `gitleaks-sha256` | checksum of `8.30.1` | SHA-256 of the `linux_x64` tarball. Update it together with the version. |
+| `fail-on-finding` | `true` | Gate workflow only. `false` logs a warning instead of failing the job on a finding (observation mode). Any other value keeps the gate blocking. Execution errors always fail. |
 | `relay-url`, `relay-audience` | none | Report workflow only. Required. |
 | `max-findings-per-run` | `500` | Report workflow only. Cap on findings sent per run. |
 | `job-timeout-minutes` | `15` | Job timeout. The gate also exposes `gate-timeout-minutes`. |
