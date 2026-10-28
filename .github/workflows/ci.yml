@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install gitleaks
+        run: .github/actions/gitleaks-scan/install-gitleaks.sh 8.30.1 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+      - name: Unit tests
+        working-directory: .github/actions/gitleaks-scan
+        run: ./tests/run.sh
+      - name: shellcheck
+        working-directory: .github/actions/gitleaks-scan
+        run: shellcheck -x *.sh
