@@ -1,0 +1,306 @@
+name: gitleaks-scan
+description: >-
+  Runs the gitleaks gate scan (Passada 1) and, in report mode, derives and sends findings to the relay.
+  Callers using this action directly (not via secret-scan-gate.yml/secret-scan-report.yml) should write
+  a job-start timestamp to "$RUNNER_TEMP/.job-start-epoch" (date +%s) before checkout, so relay
+  retry deadlines are budgeted from the real job start — a missing file falls back to this step's own
+  start time, which is safe but under-budgets any time already spent on checkout/setup.
+inputs:
+  mode:
+    required: true
+    description: "'gate' or 'report'"
+  baseline-path:
+    default: "gitleaks-baseline.json"
+    description: "Path to the gitleaks baseline file, relative to the repo root."
+  config-path:
+    default: ""
+    description: "Path to a custom gitleaks config file, relative to the repo root. Empty means gitleaks auto-discovers .gitleaks.toml."
+  gitleaks-version:
+    default: "8.30.1"
+    description: "gitleaks release version to install."
+  gitleaks-sha256:
+    default: "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
+    description: "SHA-256 of the linux_x64 release tarball for gitleaks-version — must always be updated together with it."
+  relay-url:
+    default: ""
+    description: "Findings Relay base URL. Required (non-empty) in report mode; unused in gate mode."
+  relay-audience:
+    default: ""
+    description: "OIDC audience the relay expects. Required (non-empty) in report mode; unused in gate mode."
+  max-findings-per-run:
+    default: "500"
+    description: "Ceiling on findings sent to the relay in one run (report mode only) — see spec §6.3."
+  job-timeout-minutes:
+    default: "15"
+    description: "Used to bound the relay HTTP retry loop's deadline (report mode only) — must match the job's own timeout-minutes."
+outputs:
+  gate-status:
+    description: "gitleaks exit code from Passada 1 (0/42/1)"
+    value: ${{ steps.gate.outputs.gate-status }}
+  range-fallback:
+    description: "1 if the empty-range guard fired (scan is an approximation, not full coverage — spec §5/§10), 0 otherwise"
+    value: ${{ steps.gate.outputs.range-fallback }}
+  log-opts:
+    description: "The --log-opts value Passada 1 computed, reused by Passada 2 in report mode so both passes scan the identical range"
+    value: ${{ steps.gate.outputs.log-opts }}
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      # Via env:, not interpolated directly into the run: command string
+      # (post-PR-review fix, 3rd round — the one remaining inconsistency
+      # with every other step in this file, which all pass caller-provided
+      # values through env: rather than string-substituting them into the
+      # script). Risk here was always low (values come from the adopting
+      # workflow's own config, not attacker-controlled input), but nothing
+      # in this file should model deviate from the pattern the rest of it
+      # hardens.
+      env:
+        GITLEAKS_VERSION: ${{ inputs.gitleaks-version }}
+        GITLEAKS_SHA256: ${{ inputs.gitleaks-sha256 }}
+      run: |
+        "${{ github.action_path }}/install-gitleaks.sh" "$GITLEAKS_VERSION" "$GITLEAKS_SHA256"
+
+    - id: gate
+      shell: bash
+      env:
+        EVENT_NAME: ${{ github.event_name }}
+        BEFORE: ${{ github.event.before }}
+        AFTER: ${{ github.event.after || github.sha }}
+        BASE_REF: ${{ github.event.pull_request.base.ref }}
+        BASE_SHA: ${{ github.event.merge_group.base_sha }}
+        DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        BASELINE_PATH: ${{ inputs.baseline-path }}
+        CONFIG_PATH: ${{ inputs.config-path }}
+        MODE: ${{ inputs.mode }}
+        REPORT_PATH: ${{ runner.temp }}/gate-report.json
+      run: |
+        set +e
+        "${{ github.action_path }}/scan.sh" 2>"${{ runner.temp }}/scan_stderr.log"
+        status=$?
+        set -e
+        cat "${{ runner.temp }}/scan_stderr.log" >&2  # forward SCAN_RANGE_FALLBACK/SCAN_LOG_OPTS and any warnings
+
+        # `|| true` on each extraction (round-2 review fix): if scan.sh died
+        # before emitting these lines at all (unknown event, REPORT_PATH
+        # missing), grep finding nothing must not itself abort this step
+        # under set -e before gate-status gets written below.
+        fallback=$(grep -o 'SCAN_RANGE_FALLBACK=[01]' "${{ runner.temp }}/scan_stderr.log" | cut -d= -f2) || true
+        log_opts=$(grep '^SCAN_LOG_OPTS::' "${{ runner.temp }}/scan_stderr.log" | tail -n1 | sed 's/^SCAN_LOG_OPTS:://') || true
+
+        echo "gate-status=$status" >> "$GITHUB_OUTPUT"
+        echo "range-fallback=${fallback:-0}" >> "$GITHUB_OUTPUT"
+        echo "log-opts=${log_opts:-}" >> "$GITHUB_OUTPUT"
+        # `!= "report"`, not `= "gate"` (round-5 review fix — fail-closed,
+        # not fail-open): this is a security gate. An empty/typo'd `mode`
+        # input should behave like gate (propagate the real exit code) and
+        # block merge on a real finding, not silently behave like report
+        # (never fail) just because it didn't match the string "gate"
+        # exactly.
+        if [ "$MODE" != "report" ]; then
+          exit "$status"
+        fi
+        # mode == report: never fail this step regardless of gate-status —
+        # the report step (Task 8) reads steps.gate.outputs.* directly, and
+        # this workflow's own job status never matters to anything (spec §7).
+        exit 0
+
+    - id: derive
+      if: inputs.mode == 'report'
+      continue-on-error: true
+      shell: bash
+      env:
+        RELAY_AUDIENCE: ${{ inputs.relay-audience }}
+        RELAY_URL: ${{ inputs.relay-url }}
+        GATE_STATUS: ${{ steps.gate.outputs.gate-status }}
+        LOG_OPTS: ${{ steps.gate.outputs.log-opts }}
+        EVENT_NAME: ${{ github.event_name }}
+        CONFIG_PATH: ${{ inputs.config-path }}
+        COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+        MAX_FINDINGS_PER_RUN: ${{ inputs.max-findings-per-run }}
+        JOB_TIMEOUT_MINUTES: ${{ inputs.job-timeout-minutes }}
+      run: |
+        set -euo pipefail
+        source "${{ github.action_path }}/report-relay.sh"
+
+        echo "findings-count=0" >> "$GITHUB_OUTPUT"
+        echo "unavailable-count=0" >> "$GITHUB_OUTPUT"
+        # Logged unconditionally, not just once findings-count is known to
+        # be nonzero (round-5 review fix): Task 10 Step 1b's N/N+1 check
+        # needs to read "N" (often 0, on the very first probe push) from
+        # this same log line — a notice emitted only inside the "found
+        # something" branch further down means the N=0 baseline case has
+        # nothing to read, which is exactly the run the invariant test
+        # needs first.
+        echo "::notice::findings-count=0"
+
+        case "$EVENT_NAME" in
+          push|pull_request|schedule|workflow_dispatch) ;;
+          *)
+            echo "::warning::event_name=$EVENT_NAME fora da tabela do relay — pulando envio, só reportando localmente"
+            exit 0
+            ;;
+        esac
+
+        token=$(request_oidc_token "$RELAY_AUDIENCE") || {
+          echo "::warning::sem token OIDC disponível (fork PR, misconfiguração, ou evento sem id-token concedido) — pulando envio ao relay"
+          exit 0
+        }
+
+        # Deadline budgeted from the JOB's actual start, not this step's own
+        # $SECONDS (round-4 review fix) — checkout, install, and Passada 1/2
+        # already consumed part of the job's real timeout-minutes budget by
+        # the time this step runs; a deadline computed from a step-local
+        # $SECONDS=0 could plan retries well past the point the whole job
+        # gets killed, taking run-report down with it.
+        # Fallback (post-PR-review fix): the caller workflow is expected to
+        # write this file before checkout (secret-scan-gate.yml/
+        # secret-scan-report.yml both do), but this action is public — any
+        # repo in the org can `uses:` it directly without going through
+        # either of those files. Without the fallback, a caller that never
+        # wrote the file made this abort under set -e, continue-on-error
+        # swallowed it, and a spurious status: "failure" heartbeat got sent
+        # to the relay. See the description: note below.
+        job_start=$(cat "${{ runner.temp }}/.job-start-epoch" 2>/dev/null || echo "$(date +%s)")
+        elapsed=$(( $(date +%s) - job_start ))
+        remaining_budget=$(( JOB_TIMEOUT_MINUTES * 60 - elapsed - 90 ))  # 90s headroom for the run-report step, itself budgeted below
+        [ "$remaining_budget" -lt 0 ] && remaining_budget=0
+        deadline=$((SECONDS + remaining_budget))
+
+        if [ "$GATE_STATUS" = "42" ]; then
+          scan_raw="${{ runner.temp }}/report-raw.json"
+          # Registered before scan-passada2.sh runs, not after (round-2
+          # review fix) — a trap on a path that doesn't exist yet is
+          # harmless (rm -f is a no-op), and a crash mid-write used to leave
+          # a file full of real secrets on the runner for the rest of the job.
+          # Includes $RELAY_RESP_FILE too (round-3 review fix): bash has only
+          # ONE EXIT trap per shell, and report-relay.sh (sourced above)
+          # already registered its own for that file — a bare `trap '...' EXIT`
+          # here silently REPLACES it rather than adding to it, so without
+          # re-including it, that file stops being cleaned up the moment this
+          # line runs, with nothing to catch the regression.
+          trap 'rm -f "$scan_raw" "${RELAY_RESP_FILE:-}"' EXIT
+          # Reuses Passada 1's exact range (round-2 review fix — an earlier
+          # draft always passed "" here, silently re-scanning full history
+          # regardless of what Passada 1 actually scanned).
+          "${{ github.action_path }}/scan-passada2.sh" "$LOG_OPTS" "$CONFIG_PATH" "$scan_raw"
+
+          gate_report="${{ runner.temp }}/gate-report.json"
+          # True total is read directly off Passada 1's report — cheap
+          # (no correlation) — BEFORE calling derive-findings.sh, whose own
+          # 4th arg bounds the expensive correlation work (Fingerprint+
+          # column linear scan per finding, O(n) per finding against
+          # Passada 2's raw findings) to at most MAX_FINDINGS_PER_RUN
+          # entries (post-PR-review fix, 3rd round). Without this, a legacy
+          # repo's first full-history schedule scan with thousands of
+          # pre-existing findings could spend the whole job-timeout-minutes
+          # budget correlating findings that would just get truncated
+          # afterward anyway, delivering ZERO items and leaving run-report
+          # only the deadline's last few seconds for its own heartbeat.
+          # findings_count itself must stay the TRUE total, not the
+          # truncated one — it's what gets reported to the relay via
+          # run-report's FINDINGS_COUNT, and understating it would hide how
+          # much a repo is actually over the cap.
+          findings_count=$(jq 'length' "$gate_report")
+          echo "findings-count=$findings_count" >> "$GITHUB_OUTPUT"
+          # $GITHUB_OUTPUT values are never echoed into the job log by the
+          # runner (round-3 review fix) — without a log line, Task 10 Step 1b
+          # ("gate and report must agree on whether there's a new finding")
+          # has nothing observable to assert on from the report side.
+          echo "::notice::findings-count=$findings_count"
+
+          items=$("${{ github.action_path }}/derive-findings.sh" "$gate_report" "$scan_raw" "$COMMIT" "$MAX_FINDINGS_PER_RUN")
+
+          if [ "$findings_count" -gt "$MAX_FINDINGS_PER_RUN" ]; then
+            echo "::warning::$findings_count achados excedem max-findings-per-run=$MAX_FINDINGS_PER_RUN — enviando só os primeiros $MAX_FINDINGS_PER_RUN, run-report sairá partial"
+            echo "unavailable-count=1" >> "$GITHUB_OUTPUT"
+          fi
+
+          if [ "$(jq 'length' <<<"$items")" -gt 0 ]; then
+            result=$(post_findings_batch "$RELAY_URL" "$token" "$items" "$deadline")
+            unavailable=$(echo "$result" | grep -o 'unavailable_count=[0-9]*' | cut -d= -f2 || echo 1)
+            if [ "$unavailable" -gt 0 ]; then
+              echo "unavailable-count=1" >> "$GITHUB_OUTPUT"
+            fi
+          fi
+        fi
+
+    - id: run-report
+      if: always() && inputs.mode == 'report'
+      shell: bash
+      env:
+        RELAY_URL: ${{ inputs.relay-url }}
+        RELAY_AUDIENCE: ${{ inputs.relay-audience }}
+        EVENT_NAME: ${{ github.event_name }}
+        GATE_STATUS: ${{ steps.gate.outputs.gate-status }}
+        RANGE_FALLBACK: ${{ steps.gate.outputs.range-fallback }}
+        FINDINGS_COUNT: ${{ steps.derive.outputs.findings-count || '0' }}
+        DERIVE_UNAVAILABLE: ${{ steps.derive.outputs.unavailable-count || '0' }}
+        DERIVE_OUTCOME: ${{ steps.derive.outcome }}
+        COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+        JOB_TIMEOUT_MINUTES: ${{ inputs.job-timeout-minutes }}
+      run: |
+        set -euo pipefail
+        source "${{ github.action_path }}/report-relay.sh"
+
+        # Gated on EVENT_NAME directly (post-PR-review fix), not on a
+        # token-marker-file's existence: derive is skipped (not run)
+        # whenever an earlier step in THIS job dies first (the only
+        # realistic case: install-gitleaks.sh failing on a bad checksum/
+        # version/network), and that's exactly the case where a failure
+        # heartbeat matters most — the job is red, but a marker-file gate
+        # meant sending nothing here, leaving the relay/SOC with no signal
+        # either way.
+        case "$EVENT_NAME" in
+          push|pull_request|schedule|workflow_dispatch) ;;
+          *)
+            exit 0
+            ;;
+        esac
+        # Always requests its OWN fresh token rather than reusing derive's
+        # (round-5 review fix): the token could be many minutes old by the
+        # time run-report runs (Passada 2 + a retry loop budgeted up to
+        # job-timeout-minutes-90s may have elapsed in derive), and GitHub's
+        # OIDC JWTs are short-lived. Spec §6.4's own error table lists
+        # token expiry during a long retry as a real, expected 401 cause —
+        # reusing the same token maximizes exposure to exactly that instead
+        # of avoiding it. OIDC is still available in this step regardless
+        # of what derive did (ACTIONS_ID_TOKEN_REQUEST_URL/TOKEN are
+        # job-scoped, not step-scoped), so asking again is cheap and safe.
+        token=$(request_oidc_token "$RELAY_AUDIENCE") || {
+          echo "::warning::token OIDC não pôde ser renovado no step run-report — pulando envio do heartbeat"
+          exit 0
+        }
+
+        status="success"
+        # Passada 1/2 ran but the scan itself was an approximation (empty-
+        # range guard fired, spec §5/§10) — never claim full coverage.
+        [ "$RANGE_FALLBACK" = "1" ] && status="partial"
+        [ "$DERIVE_UNAVAILABLE" = "1" ] && status="partial"
+        # derive step had a genuine internal failure (correlation aborted,
+        # HTTP truly broken) — distinct from "skipped cleanly" (outcome is
+        # still success in that case, since derive exits 0 for skip paths).
+        [ "$DERIVE_OUTCOME" = "failure" ] && status="failure"
+        # derive's own `if: inputs.mode == 'report'` is identical to this
+        # step's, so within run-report (mode is always 'report' here) the
+        # ONLY way derive's outcome is "skipped" is a prior step in this
+        # same job (install-gitleaks.sh, realistically) dying first — the
+        # gap A2 fixed above by no longer gating this whole step on a
+        # token-file marker that step never got to write.
+        [ "$DERIVE_OUTCOME" = "skipped" ] && status="failure"
+        # gitleaks itself errored (exit 1, not 42) — genuine execution
+        # failure, not "found a real secret" (that's exit 42, handled above
+        # via findings-count/range-fallback, and correctly stays "success").
+        [ "$GATE_STATUS" = "1" ] && status="failure"
+
+        # Same fix as the derive step above (round-4 review): budget from
+        # actual job start, not this step's own fresh $SECONDS=0 — an
+        # earlier draft gave run-report the FULL job-timeout-minutes with
+        # zero headroom, on top of already double-counting time the derive
+        # step had already spent.
+        job_start=$(cat "${{ runner.temp }}/.job-start-epoch" 2>/dev/null || echo "$(date +%s)")
+        elapsed=$(( $(date +%s) - job_start ))
+        remaining_budget=$(( JOB_TIMEOUT_MINUTES * 60 - elapsed - 15 ))  # 15s headroom to actually return before the job is killed
+        [ "$remaining_budget" -lt 5 ] && remaining_budget=5
+        deadline=$((SECONDS + remaining_budget))
+        post_run_report "$RELAY_URL" "$token" "$status" "$FINDINGS_COUNT" "$COMMIT" "$deadline" || true
